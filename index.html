@@ -342,6 +342,7 @@
                     this.displayResult(text);
                     this.showStatus('Conversion completed successfully!', 'success');
                 } catch (error) {
+                    console.error('Conversion error:', error);
                     this.showStatus(`Error: ${error.message}`, 'error');
                 } finally {
                     this.hideProgress();
@@ -350,28 +351,43 @@
 
             isValidFile(file) {
                 const fileName = file.name.toLowerCase();
-                return fileName.endsWith('.epub') || 
-                       fileName.endsWith('.epub.zip') || 
-                       (fileName.endsWith('.zip') && fileName.includes('epub'));
+                // Check if it's a direct EPUB file
+                if (fileName.endsWith('.epub')) {
+                    return true;
+                }
+                // Check if it's a ZIP file that might contain EPUB
+                if (fileName.endsWith('.zip')) {
+                    // Accept .epub.zip or any .zip that might contain EPUB
+                    return true;
+                }
+                return false;
             }
 
             getBaseFileName(fileName) {
-                if (fileName.toLowerCase().endsWith('.epub.zip')) {
-                    return fileName.slice(0, -9); // Remove .epub.zip
-                } else if (fileName.toLowerCase().endsWith('.epub')) {
-                    return fileName.slice(0, -5); // Remove .epub
-                } else if (fileName.toLowerCase().endsWith('.zip')) {
-                    return fileName.slice(0, -4); // Remove .zip
+                // Remove all possible extensions to get the base name
+                let baseName = fileName;
+                
+                // Remove extensions in order of specificity
+                if (baseName.toLowerCase().endsWith('.epub.zip')) {
+                    baseName = baseName.slice(0, -9);
+                } else if (baseName.toLowerCase().endsWith('.epub')) {
+                    baseName = baseName.slice(0, -5);
+                } else if (baseName.toLowerCase().endsWith('.zip')) {
+                    baseName = baseName.slice(0, -4);
                 }
-                return fileName;
+                
+                return baseName;
             }
 
             async convertFile(file) {
                 const fileName = file.name.toLowerCase();
                 
-                if (fileName.endsWith('.epub.zip') || (fileName.endsWith('.zip') && fileName.includes('epub'))) {
+                // Check if it's a ZIP file (including .epub.zip)
+                if (fileName.endsWith('.zip')) {
+                    // Try to process as ZIP containing EPUB
                     return await this.convertEPUBZip(file);
                 } else if (fileName.endsWith('.epub')) {
+                    // Process as direct EPUB
                     return await this.convertEPUB(file);
                 } else {
                     throw new Error('Unsupported file format');
@@ -387,22 +403,37 @@
                             const JSZip = await this.loadJSZip();
                             const outerZip = await JSZip.loadAsync(arrayBuffer);
                             
-                            // Find the .epub file inside the zip
-                            let epubFile = null;
+                            // Find EPUB files inside the zip
+                            const epubFiles = [];
                             outerZip.forEach((relativePath, zipEntry) => {
                                 if (relativePath.toLowerCase().endsWith('.epub') && !zipEntry.dir) {
-                                    epubFile = zipEntry;
+                                    epubFiles.push({
+                                        path: relativePath,
+                                        entry: zipEntry
+                                    });
                                 }
                             });
 
-                            if (!epubFile) {
-                                throw new Error('No EPUB file found in the ZIP archive');
+                            if (epubFiles.length === 0) {
+                                // No EPUB found, check if the ZIP itself is an EPUB
+                                // (sometimes EPUB files are renamed to .zip)
+                                try {
+                                    const text = await this.processEPUBContent(outerZip);
+                                    resolve(text);
+                                    return;
+                                } catch (innerError) {
+                                    throw new Error('No EPUB file found in the ZIP archive');
+                                }
                             }
 
                             this.updateProgress(25);
                             
+                            // If multiple EPUB files, process the first one
+                            // You could enhance this to let user choose
+                            const epubFile = epubFiles[0];
+                            
                             // Extract the EPUB file
-                            const epubArrayBuffer = await epubFile.async('arraybuffer');
+                            const epubArrayBuffer = await epubFile.entry.async('arraybuffer');
                             
                             this.updateProgress(50);
                             
@@ -440,35 +471,108 @@
             }
 
             async processEPUBContent(zip) {
-                const contentFiles = [];
-                zip.forEach((relativePath, zipEntry) => {
-                    if (relativePath.match(/\.(html|xhtml|htm)$/i) && !zipEntry.dir) {
-                        contentFiles.push({
-                            path: relativePath,
-                            entry: zipEntry
-                        });
+                // First, try to find the OPF file to get proper reading order
+                let opfFile = null;
+                let contentOpf = null;
+                
+                // Look for container.xml first
+                try {
+                    const containerXml = await zip.file('META-INF/container.xml').async('string');
+                    const parser = new DOMParser();
+                    const containerDoc = parser.parseFromString(containerXml, 'text/xml');
+                    const rootfileElement = containerDoc.querySelector('rootfile');
+                    if (rootfileElement) {
+                        opfFile = rootfileElement.getAttribute('full-path');
                     }
-                });
+                } catch (e) {
+                    // If no container.xml, look for .opf file
+                    zip.forEach((relativePath, zipEntry) => {
+                        if (relativePath.endsWith('.opf') && !opfFile) {
+                            opfFile = relativePath;
+                        }
+                    });
+                }
 
-                if (contentFiles.length === 0) {
+                // Try to get reading order from OPF
+                let orderedFiles = [];
+                if (opfFile) {
+                    try {
+                        contentOpf = await zip.file(opfFile).async('string');
+                        const parser = new DOMParser();
+                        const opfDoc = parser.parseFromString(contentOpf, 'text/xml');
+                        
+                        // Get spine items in order
+                        const spineItems = opfDoc.querySelectorAll('spine itemref');
+                        const manifest = opfDoc.querySelector('manifest');
+                        
+                        for (const item of spineItems) {
+                            const idref = item.getAttribute('idref');
+                            const manifestItem = manifest.querySelector(`item[id="${idref}"]`);
+                            if (manifestItem) {
+                                const href = manifestItem.getAttribute('href');
+                                if (href) {
+                                    // Resolve relative path
+                                    const opfDir = opfFile.substring(0, opfFile.lastIndexOf('/'));
+                                    const fullPath = opfDir ? `${opfDir}/${href}` : href;
+                                    orderedFiles.push(fullPath);
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('Could not parse OPF file:', e);
+                    }
+                }
+
+                // If we couldn't get order from OPF, fall back to finding all HTML files
+                if (orderedFiles.length === 0) {
+                    const contentFiles = [];
+                    zip.forEach((relativePath, zipEntry) => {
+                        if (relativePath.match(/\.(html|xhtml|htm)$/i) && !zipEntry.dir) {
+                            contentFiles.push(relativePath);
+                        }
+                    });
+                    
+                    // Sort files by path (alphabetical/numerical order)
+                    orderedFiles = contentFiles.sort((a, b) => {
+                        // Try to sort by chapter numbers if present
+                        const aMatch = a.match(/(\d+)/);
+                        const bMatch = b.match(/(\d+)/);
+                        if (aMatch && bMatch) {
+                            return parseInt(aMatch[1]) - parseInt(bMatch[1]);
+                        }
+                        return a.localeCompare(b);
+                    });
+                }
+
+                if (orderedFiles.length === 0) {
                     throw new Error('No HTML content files found in EPUB');
                 }
 
-                // Sort files to maintain reading order
-                contentFiles.sort((a, b) => a.path.localeCompare(b.path));
-
                 let fullText = '';
-                const startProgress = 50; // Start from 50% if this is from EPUB.ZIP
+                let isFirstFile = true;
+                const progressStart = zip.file('META-INF/container.xml') ? 50 : 0;
                 
-                for (let i = 0; i < contentFiles.length; i++) {
-                    const file = contentFiles[i];
-                    const progress = startProgress + ((i / contentFiles.length) * 50);
+                for (let i = 0; i < orderedFiles.length; i++) {
+                    const filePath = orderedFiles[i];
+                    const progress = progressStart + ((i / orderedFiles.length) * 50);
                     this.updateProgress(progress);
                     
-                    const content = await file.entry.async('string');
-                    const text = this.extractTextFromHTML(content);
-                    if (text.trim()) {
-                        fullText += text + '\n\n';
+                    try {
+                        const file = zip.file(filePath);
+                        if (file) {
+                            const content = await file.async('string');
+                            const text = this.extractTextFromHTML(content);
+                            if (text.trim()) {
+                                // Add chapter separation (except for the first file)
+                                if (!isFirstFile && !text.match(/^(Chapter|CHAPTER)/)) {
+                                    fullText += '\n\n\n';
+                                }
+                                fullText += text;
+                                isFirstFile = false;
+                            }
+                        }
+                    } catch (e) {
+                        console.warn(`Could not process file ${filePath}:`, e);
                     }
                 }
 
@@ -495,55 +599,199 @@
                 const parser = new DOMParser();
                 const doc = parser.parseFromString(html, 'text/html');
                 
-                // Remove script and style elements
-                const scripts = doc.querySelectorAll('script, style');
-                scripts.forEach(el => el.remove());
+                // Remove script, style, and other non-content elements
+                const elementsToRemove = doc.querySelectorAll('script, style, nav[role="navigation"], aside.sidebar');
+                elementsToRemove.forEach(el => el.remove());
                 
-                // Process text nodes to preserve formatting
-                const walker = document.createTreeWalker(
-                    doc.body || doc.documentElement,
-                    NodeFilter.SHOW_TEXT,
-                    null,
-                    false
-                );
-
-                let textParts = [];
-                let node;
-                while (node = walker.nextNode()) {
-                    const text = node.textContent.trim();
-                    if (text) {
-                        const parent = node.parentElement;
-                        if (parent) {
-                            const tagName = parent.tagName.toLowerCase();
-                            // Add line breaks for block elements
-                            if (['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'br'].includes(tagName)) {
-                                if (textParts.length > 0 && !textParts[textParts.length - 1].endsWith('\n')) {
-                                    textParts.push('\n');
+                // Get body or document element
+                const contentRoot = doc.body || doc.documentElement;
+                
+                // StringBuilder approach for better performance and control
+                let textBuilder = [];
+                let lastWasBlock = false;
+                
+                // Process the content while preserving structure
+                const processNode = (node, depth = 0) => {
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        const text = node.textContent;
+                        if (text.trim()) {
+                            // Preserve the original text with its spaces
+                            textBuilder.push(text.replace(/\s+/g, ' '));
+                            lastWasBlock = false;
+                        }
+                    } else if (node.nodeType === Node.ELEMENT_NODE) {
+                        const tagName = node.tagName.toLowerCase();
+                        
+                        // Skip hidden elements
+                        const style = window.getComputedStyle ? null : node.style;
+                        if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+                            return;
+                        }
+                        
+                        // Handle different element types
+                        switch (tagName) {
+                            // Headings - add extra spacing and preserve heading structure
+                            case 'h1':
+                            case 'h2':
+                            case 'h3':
+                            case 'h4':
+                            case 'h5':
+                            case 'h6':
+                                if (textBuilder.length > 0 && !lastWasBlock) {
+                                    textBuilder.push('\n\n');
                                 }
-                            }
-                            textParts.push(text);
-                            if (['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'br'].includes(tagName)) {
-                                textParts.push('\n');
-                            }
-                        } else {
-                            textParts.push(text);
+                                if (tagName === 'h1') {
+                                    textBuilder.push('\n'); // Extra line for major headings
+                                }
+                                // Process heading content
+                                for (const child of node.childNodes) {
+                                    processNode(child, depth + 1);
+                                }
+                                textBuilder.push('\n\n');
+                                lastWasBlock = true;
+                                return;
+                                
+                            // Paragraphs - the main content blocks
+                            case 'p':
+                                if (textBuilder.length > 0 && !lastWasBlock) {
+                                    textBuilder.push('\n\n');
+                                }
+                                // Process paragraph content inline
+                                for (const child of node.childNodes) {
+                                    processNode(child, depth + 1);
+                                }
+                                textBuilder.push('\n\n');
+                                lastWasBlock = true;
+                                return;
+                                
+                            // Line breaks
+                            case 'br':
+                                textBuilder.push('\n');
+                                return;
+                                
+                            // Horizontal rules - scene breaks
+                            case 'hr':
+                                if (textBuilder.length > 0) {
+                                    textBuilder.push('\n\n* * *\n\n');
+                                }
+                                lastWasBlock = true;
+                                return;
+                                
+                            // Lists
+                            case 'ul':
+                            case 'ol':
+                                if (textBuilder.length > 0 && !lastWasBlock) {
+                                    textBuilder.push('\n\n');
+                                }
+                                let listIndex = 1;
+                                for (const child of node.childNodes) {
+                                    if (child.nodeType === Node.ELEMENT_NODE && child.tagName.toLowerCase() === 'li') {
+                                        if (tagName === 'ul') {
+                                            textBuilder.push('• ');
+                                        } else {
+                                            textBuilder.push(`${listIndex}. `);
+                                            listIndex++;
+                                        }
+                                        // Process list item content
+                                        for (const liChild of child.childNodes) {
+                                            processNode(liChild, depth + 1);
+                                        }
+                                        textBuilder.push('\n');
+                                    }
+                                }
+                                textBuilder.push('\n');
+                                lastWasBlock = true;
+                                return;
+                                
+                            // Block quotes
+                            case 'blockquote':
+                                if (textBuilder.length > 0 && !lastWasBlock) {
+                                    textBuilder.push('\n\n');
+                                }
+                                textBuilder.push('    ');
+                                for (const child of node.childNodes) {
+                                    processNode(child, depth + 1);
+                                }
+                                textBuilder.push('\n\n');
+                                lastWasBlock = true;
+                                return;
+                                
+                            // Divs and sections - check for semantic meaning
+                            case 'div':
+                            case 'section':
+                            case 'article':
+                                // Check if this might be a chapter or major section
+                                const className = node.className || '';
+                                const id = node.id || '';
+                                if (className.match(/chapter|section/i) || id.match(/chapter|section/i)) {
+                                    if (textBuilder.length > 0) {
+                                        textBuilder.push('\n\n\n');
+                                    }
+                                    lastWasBlock = true;
+                                }
+                                break;
+                                
+                            // Inline elements that might need special handling
+                            case 'em':
+                            case 'i':
+                                textBuilder.push('_');
+                                for (const child of node.childNodes) {
+                                    processNode(child, depth + 1);
+                                }
+                                textBuilder.push('_');
+                                return;
+                                
+                            case 'strong':
+                            case 'b':
+                                textBuilder.push('**');
+                                for (const child of node.childNodes) {
+                                    processNode(child, depth + 1);
+                                }
+                                textBuilder.push('**');
+                                return;
+                        }
+                        
+                        // Process children for any other elements
+                        for (const child of node.childNodes) {
+                            processNode(child, depth + 1);
                         }
                     }
-                }
-
-                return textParts.join('');
+                };
+                
+                // Start processing
+                processNode(contentRoot);
+                
+                // Join and clean up the result
+                let result = textBuilder.join('');
+                
+                // Clean up excessive whitespace while preserving structure
+                result = result.replace(/[ \t]+/g, ' '); // Multiple spaces to single
+                result = result.replace(/\n[ \t]+/g, '\n'); // Remove indent spaces
+                result = result.replace(/[ \t]+\n/g, '\n'); // Remove trailing spaces
+                result = result.replace(/\n{4,}/g, '\n\n\n'); // Max 3 newlines
+                
+                return result;
             }
 
             formatText(text) {
-                // Clean up excessive whitespace while preserving intentional formatting
-                text = text.replace(/[ \t]+/g, ' '); // Multiple spaces/tabs to single space
-                text = text.replace(/\n[ \t]+/g, '\n'); // Remove leading whitespace on lines
-                text = text.replace(/[ \t]+\n/g, '\n'); // Remove trailing whitespace on lines
-                text = text.replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
+                // This is now much simpler since we preserve formatting in extraction
+                // Just do minimal cleanup without destroying the structure
                 
-                // Ensure paragraphs are properly separated
-                text = text.replace(/([.!?])\n([A-Z])/g, '$1\n\n$2');
+                // Fix any spacing issues around punctuation
+                text = text.replace(/\s+([.,!?;:])/g, '$1'); // Remove space before punctuation
+                text = text.replace(/([.,!?;:])([A-Za-z])/g, '$1 $2'); // Add space after punctuation if missing
                 
+                // Fix quotes
+                text = text.replace(/"\s+/g, '"'); // Remove space after opening quote
+                text = text.replace(/\s+"/g, '"'); // Remove space before closing quote
+                
+                // Preserve paragraph breaks but clean up excessive newlines
+                text = text.replace(/\n{4,}/g, '\n\n\n'); // Max 3 newlines (for chapter breaks)
+                
+                // Clean up any tabs
+                text = text.replace(/\t/g, '    '); // Convert tabs to spaces
+                
+                // Final trim
                 return text.trim();
             }
 
@@ -551,10 +799,14 @@
                 const fileInfo = document.getElementById('fileInfo');
                 const fileDetails = document.getElementById('fileDetails');
                 
+                const fileType = file.name.toLowerCase().endsWith('.epub.zip') ? 'EPUB (Zipped)' : 
+                                file.name.toLowerCase().endsWith('.epub') ? 'EPUB' : 
+                                'ZIP (may contain EPUB)';
+                
                 fileDetails.innerHTML = `
                     <p><strong>Name:</strong> ${file.name}</p>
                     <p><strong>Size:</strong> ${(file.size / 1024 / 1024).toFixed(2)} MB</p>
-                    <p><strong>Type:</strong> ${file.type || 'application/epub+zip'}</p>
+                    <p><strong>Type:</strong> ${fileType}</p>
                 `;
                 
                 fileInfo.style.display = 'block';
@@ -604,23 +856,51 @@
                     textArea.value = this.convertedText;
                     document.body.appendChild(textArea);
                     textArea.select();
-                    document.execCommand('copy');
+                    try {
+                        document.execCommand('copy');
+                        this.showStatus('Text copied to clipboard!', 'success');
+                    } catch (e) {
+                        this.showStatus('Failed to copy text', 'error');
+                    }
                     document.body.removeChild(textArea);
-                    this.showStatus('Text copied to clipboard!', 'success');
                 }
             }
 
             downloadText() {
-                const blob = new Blob([this.convertedText], { type: 'text/plain' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `${this.currentFileName}.txt`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                this.showStatus('Download started!', 'success');
+                if (!this.convertedText) {
+                    this.showStatus('No text to download', 'error');
+                    return;
+                }
+                
+                try {
+                    // Create blob with UTF-8 BOM to ensure proper encoding
+                    const BOM = '\uFEFF';
+                    const blob = new Blob([BOM + this.convertedText], { 
+                        type: 'text/plain;charset=utf-8' 
+                    });
+                    
+                    // Create download link
+                    const url = window.URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `${this.currentFileName || 'converted'}.txt`;
+                    
+                    // Force download by triggering click
+                    link.style.display = 'none';
+                    document.body.appendChild(link);
+                    link.click();
+                    
+                    // Cleanup
+                    setTimeout(() => {
+                        document.body.removeChild(link);
+                        window.URL.revokeObjectURL(url);
+                    }, 100);
+                    
+                    this.showStatus('Download started!', 'success');
+                } catch (error) {
+                    console.error('Download error:', error);
+                    this.showStatus('Download failed. Try copying the text instead.', 'error');
+                }
             }
 
             clearOutput() {
