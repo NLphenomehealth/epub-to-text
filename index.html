@@ -239,8 +239,8 @@
         <div class="upload-section" onclick="document.getElementById('fileInput').click()">
             <div class="upload-icon">📖</div>
             <div class="upload-text">Click to select an EPUB file or drag & drop</div>
-            <div class="upload-hint">Supports .epub files up to 50MB</div>
-            <input type="file" id="fileInput" accept=".epub" />
+            <div class="upload-hint">Supports .epub and .epub.zip files up to 50MB</div>
+            <input type="file" id="fileInput" accept=".epub,.zip" />
         </div>
 
         <div class="file-info" id="fileInfo">
@@ -323,8 +323,8 @@
             }
 
             async processFile(file) {
-                if (!file.name.toLowerCase().endsWith('.epub')) {
-                    this.showStatus('Please select a valid EPUB file.', 'error');
+                if (!this.isValidFile(file)) {
+                    this.showStatus('Please select a valid EPUB or EPUB.ZIP file.', 'error');
                     return;
                 }
 
@@ -333,12 +333,12 @@
                     return;
                 }
 
-                this.currentFileName = file.name.replace('.epub', '');
+                this.currentFileName = this.getBaseFileName(file.name);
                 this.showFileInfo(file);
                 this.showProgress();
                 
                 try {
-                    const text = await this.convertEPUB(file);
+                    const text = await this.convertFile(file);
                     this.displayResult(text);
                     this.showStatus('Conversion completed successfully!', 'success');
                 } catch (error) {
@@ -346,6 +346,78 @@
                 } finally {
                     this.hideProgress();
                 }
+            }
+
+            isValidFile(file) {
+                const fileName = file.name.toLowerCase();
+                return fileName.endsWith('.epub') || 
+                       fileName.endsWith('.epub.zip') || 
+                       (fileName.endsWith('.zip') && fileName.includes('epub'));
+            }
+
+            getBaseFileName(fileName) {
+                if (fileName.toLowerCase().endsWith('.epub.zip')) {
+                    return fileName.slice(0, -9); // Remove .epub.zip
+                } else if (fileName.toLowerCase().endsWith('.epub')) {
+                    return fileName.slice(0, -5); // Remove .epub
+                } else if (fileName.toLowerCase().endsWith('.zip')) {
+                    return fileName.slice(0, -4); // Remove .zip
+                }
+                return fileName;
+            }
+
+            async convertFile(file) {
+                const fileName = file.name.toLowerCase();
+                
+                if (fileName.endsWith('.epub.zip') || (fileName.endsWith('.zip') && fileName.includes('epub'))) {
+                    return await this.convertEPUBZip(file);
+                } else if (fileName.endsWith('.epub')) {
+                    return await this.convertEPUB(file);
+                } else {
+                    throw new Error('Unsupported file format');
+                }
+            }
+
+            async convertEPUBZip(file) {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = async (e) => {
+                        try {
+                            const arrayBuffer = e.target.result;
+                            const JSZip = await this.loadJSZip();
+                            const outerZip = await JSZip.loadAsync(arrayBuffer);
+                            
+                            // Find the .epub file inside the zip
+                            let epubFile = null;
+                            outerZip.forEach((relativePath, zipEntry) => {
+                                if (relativePath.toLowerCase().endsWith('.epub') && !zipEntry.dir) {
+                                    epubFile = zipEntry;
+                                }
+                            });
+
+                            if (!epubFile) {
+                                throw new Error('No EPUB file found in the ZIP archive');
+                            }
+
+                            this.updateProgress(25);
+                            
+                            // Extract the EPUB file
+                            const epubArrayBuffer = await epubFile.async('arraybuffer');
+                            
+                            this.updateProgress(50);
+                            
+                            // Now process the EPUB file
+                            const epubZip = await JSZip.loadAsync(epubArrayBuffer);
+                            const text = await this.processEPUBContent(epubZip);
+                            
+                            resolve(text);
+                        } catch (error) {
+                            reject(error);
+                        }
+                    };
+                    reader.onerror = () => reject(new Error('Failed to read file'));
+                    reader.readAsArrayBuffer(file);
+                });
             }
 
             async convertEPUB(file) {
@@ -356,37 +428,8 @@
                             const arrayBuffer = e.target.result;
                             const JSZip = await this.loadJSZip();
                             const zip = await JSZip.loadAsync(arrayBuffer);
-                            
-                            const contentFiles = [];
-                            zip.forEach((relativePath, zipEntry) => {
-                                if (relativePath.match(/\.(html|xhtml|htm)$/i) && !zipEntry.dir) {
-                                    contentFiles.push({
-                                        path: relativePath,
-                                        entry: zipEntry
-                                    });
-                                }
-                            });
-
-                            // Sort files to maintain reading order
-                            contentFiles.sort((a, b) => a.path.localeCompare(b.path));
-
-                            let fullText = '';
-                            for (let i = 0; i < contentFiles.length; i++) {
-                                const file = contentFiles[i];
-                                this.updateProgress((i / contentFiles.length) * 100);
-                                
-                                const content = await file.entry.async('string');
-                                const text = this.extractTextFromHTML(content);
-                                if (text.trim()) {
-                                    fullText += text + '\n\n';
-                                }
-                            }
-
-                            if (!fullText.trim()) {
-                                throw new Error('No readable content found in EPUB file');
-                            }
-
-                            resolve(this.formatText(fullText));
+                            const text = await this.processEPUBContent(zip);
+                            resolve(text);
                         } catch (error) {
                             reject(error);
                         }
@@ -394,6 +437,46 @@
                     reader.onerror = () => reject(new Error('Failed to read file'));
                     reader.readAsArrayBuffer(file);
                 });
+            }
+
+            async processEPUBContent(zip) {
+                const contentFiles = [];
+                zip.forEach((relativePath, zipEntry) => {
+                    if (relativePath.match(/\.(html|xhtml|htm)$/i) && !zipEntry.dir) {
+                        contentFiles.push({
+                            path: relativePath,
+                            entry: zipEntry
+                        });
+                    }
+                });
+
+                if (contentFiles.length === 0) {
+                    throw new Error('No HTML content files found in EPUB');
+                }
+
+                // Sort files to maintain reading order
+                contentFiles.sort((a, b) => a.path.localeCompare(b.path));
+
+                let fullText = '';
+                const startProgress = 50; // Start from 50% if this is from EPUB.ZIP
+                
+                for (let i = 0; i < contentFiles.length; i++) {
+                    const file = contentFiles[i];
+                    const progress = startProgress + ((i / contentFiles.length) * 50);
+                    this.updateProgress(progress);
+                    
+                    const content = await file.entry.async('string');
+                    const text = this.extractTextFromHTML(content);
+                    if (text.trim()) {
+                        fullText += text + '\n\n';
+                    }
+                }
+
+                if (!fullText.trim()) {
+                    throw new Error('No readable content found in EPUB file');
+                }
+
+                return this.formatText(fullText);
             }
 
             async loadJSZip() {
